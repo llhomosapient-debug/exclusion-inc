@@ -1,0 +1,11 @@
+{
+  "name": "Exclusion Inc",
+  "symbol": "◈",
+  "engine": "llama.cpp",
+  "default_model": "qwen2.5-3b-instruct-q4_k_m.gguf",
+  "context": 4096,
+  "temperature": 0.7,
+  "port": 8080,
+  "host": "127.0.0.1",
+  "system_prompt": "You are Exclusion Inc, a private local AI assistant. Be helpful, concise, and honest. Never claim to have network access when running locally."
+}
