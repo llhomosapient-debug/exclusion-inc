@@ -1,0 +1,10 @@
+{
+  "protected_resources": [
+    "system_prompt",
+    "security_configuration",
+    "credentials"
+  ],
+  "network_default": false,
+  "normal_chat_logging": false,
+  "security_audit": true
+}
