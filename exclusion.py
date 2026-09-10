@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Exclusion Inc: local AI terminal dashboard + llama.cpp client."""
+"""Exclusion Inc: stable local AI terminal UI for Termux/Android."""
 from __future__ import annotations
 
-import curses
 import hashlib
 import json
 import os
@@ -10,6 +9,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import textwrap
 import time
 import urllib.error
@@ -33,13 +33,32 @@ MODEL = str(CFG.get("default_model", "qwen2.5-3b-instruct-q4_k_m.gguf"))
 
 server: subprocess.Popen | None = None
 messages: list[dict[str, str]] = []
-chat_lines: list[str] = []
+
+# ANSI colors. No curses, no full-screen redraws, and no terminal animation.
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[36m"
+BLUE = "\033[34m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+MAGENTA = "\033[35m"
+WHITE = "\033[97m"
 
 PATTERNS = [
     r"(?:show|give|print|reveal|dump|tell)\b.{0,100}(?:system prompt|system message|hidden prompt)",
     r"(?:show|give|read|print|dump)\b.{0,100}(?:protected\.json|secret|credential|private key)",
     r"(?:ignore|bypass|disable)\b.{0,100}(?:security|audit|protection)",
 ]
+
+
+def supports_color() -> bool:
+    return sys.stdout.isatty() and os.environ.get("TERM", "") != "dumb"
+
+
+def c(code: str, text: str) -> str:
+    return f"{code}{text}{RESET}" if supports_color() else text
 
 
 def sha(value: str) -> str:
@@ -52,8 +71,7 @@ def audit(kind: str, text: str) -> None:
         previous = "0" * 64
         if AUDIT.exists():
             try:
-                last = AUDIT.read_text(encoding="utf-8").splitlines()[-1]
-                previous = json.loads(last).get("event_hash", previous)
+                previous = json.loads(AUDIT.read_text(encoding="utf-8").splitlines()[-1]).get("event_hash", previous)
             except (OSError, ValueError, IndexError, KeyError):
                 pass
         event = {
@@ -87,7 +105,7 @@ def models() -> list[Path]:
 
 def selected() -> Path | None:
     preferred = MODEL_DIR / MODEL
-    if preferred.exists() and preferred.is_file():
+    if preferred.is_file():
         return preferred
     available = models()
     return available[0] if available else None
@@ -95,22 +113,23 @@ def selected() -> Path | None:
 
 def stop_server() -> None:
     global server
-    if server is not None:
-        try:
-            if server.poll() is None:
-                server.terminate()
-                try:
-                    server.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    server.kill()
-                    server.wait(timeout=2)
-        except (OSError, subprocess.SubprocessError):
+    if server is None:
+        return
+    try:
+        if server.poll() is None:
+            server.terminate()
             try:
+                server.wait(timeout=3)
+            except subprocess.TimeoutExpired:
                 server.kill()
-            except OSError:
-                pass
-        finally:
-            server = None
+                server.wait(timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            server.kill()
+        except OSError:
+            pass
+    finally:
+        server = None
 
 
 def server_error_tail() -> str:
@@ -135,7 +154,6 @@ def start_server() -> tuple[bool, str]:
     MODEL = model.name
     stop_server()
     SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
-
     cmd = [
         str(LLAMA), "-m", str(model),
         "--host", HOST, "--port", str(PORT),
@@ -143,20 +161,14 @@ def start_server() -> tuple[bool, str]:
         "--no-webui",
     ]
     try:
-        log_handle = SERVER_LOG.open("w", encoding="utf-8")
-        server = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=log_handle,
-            start_new_session=True,
-        )
-        # The child owns the file descriptor after Popen; close our copy.
-        log_handle.close()
+        with SERVER_LOG.open("w", encoding="utf-8") as log_handle:
+            server = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=log_handle,
+                start_new_session=True,
+            )
     except (OSError, ValueError) as exc:
-        try:
-            log_handle.close()
-        except Exception:
-            pass
         server = None
         return False, f"Could not start llama-server: {exc}"
 
@@ -165,14 +177,11 @@ def start_server() -> tuple[bool, str]:
         if server.poll() is not None:
             return False, server_error_tail()
         try:
-            with urllib.request.urlopen(
-                f"http://{HOST}:{PORT}/health", timeout=0.6
-            ) as response:
+            with urllib.request.urlopen(f"http://{HOST}:{PORT}/health", timeout=0.6) as response:
                 if response.status == 200:
                     return True, f"Loaded {model.name}"
         except (urllib.error.URLError, TimeoutError, OSError):
             time.sleep(0.15)
-
     return False, "Model server timeout (check logs/llama-server.log)"
 
 
@@ -198,6 +207,7 @@ def chat(prompt: str) -> str:
         method="POST",
     )
     try:
+        started = time.monotonic()
         with urllib.request.urlopen(request, timeout=180) as response:
             payload = json.loads(response.read().decode("utf-8"))
         choices = payload.get("choices") or []
@@ -210,6 +220,8 @@ def chat(prompt: str) -> str:
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": answer},
         ])
+        elapsed = time.monotonic() - started
+        print(c(DIM, f"  {elapsed:.1f}s"))
         return answer
     except urllib.error.HTTPError as exc:
         try:
@@ -219,22 +231,6 @@ def chat(prompt: str) -> str:
         return f"Local model HTTP error {exc.code}: {detail}"
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         return f"Local model error: {exc}"
-
-
-def cpu() -> str:
-    try:
-        def read_cpu() -> tuple[int, int]:
-            first = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()[1:]
-            values = [int(x) for x in first]
-            return sum(values), values[3] + values[4]
-        before = read_cpu()
-        time.sleep(0.02)
-        after = read_cpu()
-        total = after[0] - before[0]
-        idle = after[1] - before[1]
-        return f"{100 * (1 - idle / max(total, 1)):4.1f}%"
-    except (OSError, IndexError, ValueError):
-        return "N/A"
 
 
 def ram() -> str:
@@ -250,6 +246,21 @@ def ram() -> str:
         return "N/A"
 
 
+def cpu() -> str:
+    try:
+        def read_cpu() -> tuple[int, int]:
+            values = [int(x) for x in Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()[1:]]
+            return sum(values), values[3] + values[4]
+        a = read_cpu()
+        time.sleep(0.01)
+        b = read_cpu()
+        total = b[0] - a[0]
+        idle = b[1] - a[1]
+        return f"{100 * (1 - idle / max(total, 1)):4.1f}%"
+    except (OSError, IndexError, ValueError):
+        return "N/A"
+
+
 def disk() -> str:
     try:
         usage = shutil.disk_usage(Path.home())
@@ -262,10 +273,7 @@ def os_name() -> str:
     if shutil.which("getprop"):
         try:
             version = subprocess.check_output(
-                ["getprop", "ro.build.version.release"],
-                text=True,
-                timeout=1,
-                stderr=subprocess.DEVNULL,
+                ["getprop", "ro.build.version.release"], text=True, timeout=1, stderr=subprocess.DEVNULL
             ).strip()
             return f"Android {version or '?'} / Termux"
         except (OSError, subprocess.SubprocessError):
@@ -273,192 +281,140 @@ def os_name() -> str:
     return f"{platform.system()} / Termux"
 
 
-def box(title: str, width: int) -> list[str]:
-    width = max(20, min(width - 1, 78))
-    inner = width - 2
-    content = f" {title} "[:inner].ljust(inner)
-    return ["╔" + "═" * inner + "╗", "║" + content + "║", "╚" + "═" * inner + "╝"]
-
-
-def bar(value: int, total: int, width: int = 18) -> str:
+def width() -> int:
     try:
-        fraction = max(0.0, min(1.0, value / max(total, 1)))
-        filled = int(fraction * width)
-        return "█" * filled + "░" * (width - filled)
-    except (TypeError, ZeroDivisionError):
-        return "░" * width
+        return max(40, shutil.get_terminal_size((80, 24)).columns)
+    except OSError:
+        return 80
 
 
-def redraw(screen, status: str, text: str) -> None:
-    try:
-        screen.erase()
-        height, width = screen.getmaxyx()
-        model = selected()
-        model_name = model.name if model else "NO MODEL"
-        pulse = ["◈", "◇", "◆", "◇"][int(time.time() * 5) % 4] if status in ("GENERATING", "LOADING") else SYMBOL
-        lines: list[tuple[str, bool]] = []
-
-        for row in box(f"{pulse}  EXCLUSION INC  //  LOCAL AI", width):
-            lines.append((row, True))
-        lines.append((f"  TIME {time.strftime('%H:%M:%S')}   CPU {cpu()}   RAM {ram()}   STORAGE {disk()}", False))
-        lines.append((f"  OS {os_name()}   KERNEL {platform.release()}", False))
-        for row in box("SYSTEM", width):
-            lines.append((row, True))
-        lines.extend([
-            ("  ENGINE   llama.cpp", False),
-            (f"  MODEL    {model_name}", False),
-            (f"  CONTEXT  {CONTEXT} tokens", False),
-            (f"  TEMP     {TEMP:.2f}", False),
-            (f"  SERVER   {HOST}:{PORT}", False),
-        ])
-        for row in box("STATUS", width):
-            lines.append((row, True))
-        lines.append((f"  ● {status}", False))
-        lines.append(("─" * max(1, min(width - 1, 78)), False))
-
-        footer = 4
-        usable = max(1, height - len(lines) - footer)
-        lines.extend((line, False) for line in chat_lines[-usable:])
-        while len(lines) < height - footer:
-            lines.append(("", False))
-        lines.extend([
-            ("─" * max(1, min(width - 1, 78)), False),
-            (f"  CONTEXT  {bar(len(messages), max(1, CONTEXT // 20))}  messages={len(messages)}", False),
-            (f"  {pulse}  You › {text}", False),
-        ])
-
-        for y, (row, bold) in enumerate(lines[:height]):
-            try:
-                screen.addstr(y, 0, row[: max(1, width - 1)], curses.A_BOLD if bold else 0)
-            except curses.error:
-                pass
-        screen.refresh()
-    except curses.error:
-        # A resize or terminal redraw race should never kill the AI session.
-        try:
-            screen.touchwin()
-            screen.refresh()
-        except curses.error:
-            pass
+def line(char="─") -> str:
+    return char * min(width(), 78)
 
 
-def wrap(prefix: str, value: str, width: int) -> list[str]:
-    available = max(10, width - len(prefix) - 2)
-    wrapped = textwrap.wrap(str(value), available) or [""]
-    return [prefix + wrapped[0]] + [" " * len(prefix) + line for line in wrapped[1:]]
+def print_header(status: str = "READY") -> None:
+    model = selected()
+    model_name = model.name if model else "NO MODEL"
+    print()
+    print(c(CYAN + BOLD, "╔" + "═" * 58 + "╗"))
+    print(c(CYAN + BOLD, "║") + c(WHITE + BOLD, "   ◈  EXCLUSION INC  //  LOCAL AI") + c(CYAN + BOLD, "".ljust(25) + "║"))
+    print(c(CYAN + BOLD, "╚" + "═" * 58 + "╝"))
+    print(c(DIM, f"  {os_name()}  •  llama.cpp  •  {HOST}:{PORT}"))
+    print(c(DIM, f"  MODEL {model_name}  •  CTX {CONTEXT}  •  TEMP {TEMP:.2f}"))
+    print(c(GREEN, f"  ● {status}"))
+    print(line())
 
 
-def handle_command(command: str, screen) -> tuple[bool, str]:
+def print_help() -> None:
+    print(c(CYAN + BOLD, "  COMMANDS"))
+    print(c(WHITE, "  !help                 Show commands"))
+    print(c(WHITE, "  !status               System/model status"))
+    print(c(WHITE, "  !models               List GGUF models"))
+    print(c(WHITE, "  !model <file>         Switch model"))
+    print(c(WHITE, "  !clear                Clear conversation context"))
+    print(c(WHITE, "  !reload               Restart local model server"))
+    print(c(WHITE, "  #endconvo             Exit Exclusion Inc"))
+    print(line())
+
+
+def handle_command(command: str) -> bool:
     global MODEL
     if command.lower() in ("#endconvo", "!exit", "/exit"):
-        return True, ""
+        return True
     if command in ("!help", "/help"):
-        chat_lines.extend([
-            "SYSTEM › !help  !status  !models  !model <file>  !clear  !reload  #endconvo",
-            "SYSTEM › Local-only inference • localhost server • ◈ Exclusion Inc",
-        ])
-        return False, "READY"
+        print_help()
+        return False
     if command in ("!status", "/status"):
-        chat_lines.append(f"SYSTEM › CPU {cpu()} | RAM {ram()} | STORAGE {disk()} | {os_name()} | kernel {platform.release()}")
-        return False, "READY"
+        print(c(CYAN, f"  CPU {cpu()}  |  RAM {ram()}  |  STORAGE {disk()}"))
+        print(c(DIM, f"  {os_name()}  |  kernel {platform.release()}  |  server {HOST}:{PORT}"))
+        print(line())
+        return False
     if command in ("!models", "/models"):
         available = models()
         if not available:
-            chat_lines.append("SYSTEM › Models: none")
+            print(c(YELLOW, "  No GGUF models found."))
         else:
-            chat_lines.append("SYSTEM › Models: " + ", ".join(x.name for x in available))
-        return False, "READY"
+            print(c(CYAN + BOLD, "  MODELS"))
+            for model in available:
+                marker = "●" if model.name == MODEL else "○"
+                size = model.stat().st_size / 2**30
+                print(c(GREEN if marker == "●" else WHITE, f"  {marker} {model.name}  ({size:.2f} GB)"))
+        print(line())
+        return False
     if command in ("!clear", "/clear"):
-        chat_lines.clear()
         messages.clear()
-        return False, "READY"
+        print(c(GREEN, "  ✓ Conversation context cleared."))
+        print(line())
+        return False
     if command in ("!reload", "/reload"):
+        print(c(YELLOW, "  ◌ Restarting local model server..."))
         ok, message = start_server()
-        return False, message if ok else "ERROR: " + message
+        print(c(GREEN if ok else RED, "  ✓ " + message if ok else "  ✗ " + message))
+        print(line())
+        return False
     if command.startswith("!model ") or command.startswith("/model "):
         name = command.split(None, 1)[1].strip()
         candidate = MODEL_DIR / name
-        if candidate.exists() and candidate.is_file() and candidate.suffix.lower() == ".gguf":
+        if candidate.is_file() and candidate.suffix.lower() == ".gguf":
             MODEL = candidate.name
+            print(c(YELLOW, f"  ◌ Loading {MODEL}..."))
             ok, message = start_server()
-            return False, "MODEL CHANGED: " + message if ok else "ERROR: " + message
-        return False, "Model not found: " + name
-    return False, ""
-
-
-def ui(screen) -> None:
-    global server
-    try:
-        curses.curs_set(1)
-    except curses.error:
-        pass
-    try:
-        screen.keypad(True)
-        screen.timeout(100)
-    except curses.error:
-        pass
-
-    text = ""
-    status = "LOADING"
-    ok, message = start_server()
-    status = message if ok else "ERROR: " + message
-
-    while True:
-        redraw(screen, status, text)
-        try:
-            key = screen.get_wch()
-        except curses.error:
-            # Termux/Python curses may raise "no input" on a timed get_wch().
-            # Treat it exactly like a timeout instead of crashing.
-            continue
-        except KeyboardInterrupt:
-            return
-
-        if key == curses.KEY_RESIZE:
-            continue
-        if isinstance(key, str) and key in ("\n", "\r"):
-            query = text.strip()
-            text = ""
-            if not query:
-                continue
-            should_exit, command_status = handle_command(query, screen)
-            if should_exit:
-                return
-            if command_status:
-                status = command_status
-                continue
-
-            if server is None or server.poll() is not None:
-                ok, message = start_server()
-                status = message if ok else "ERROR: " + message
-            if server is None or server.poll() is not None:
-                chat_lines.append("SYSTEM › " + status)
-                continue
-
-            width = screen.getmaxyx()[1]
-            chat_lines.extend(wrap("YOU  › ", query, width))
-            status = "GENERATING"
-            redraw(screen, status, text)
-            answer = chat(query)
-            chat_lines.extend(wrap("AI   › ", answer, width))
-            status = "READY"
-        elif key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
-            text = text[:-1]
-        elif isinstance(key, str) and key.isprintable():
-            text += key
+            print(c(GREEN if ok else RED, "  ✓ " + message if ok else "  ✗ " + message))
+        else:
+            print(c(RED, "  ✗ Model not found: " + name))
+        print(line())
+        return False
+    return False
 
 
 def main() -> None:
+    global server
     try:
-        curses.wrapper(ui)
-    except KeyboardInterrupt:
-        pass
-    except Exception as exc:
-        # Keep failures readable instead of dumping an obscure traceback.
-        print(f"\nExclusion Inc error: {type(exc).__name__}: {exc}")
+        ok, message = start_server()
+        if not ok:
+            print_header("ERROR")
+            print(c(RED, "  ✗ " + message))
+            print(c(DIM, "  Check logs/llama-server.log for server details."))
+            return
+
+        # Important: this UI intentionally does NOT use curses, clear-screen loops,
+        # cursor movement, or animation. Termux can render it like a normal shell.
+        print_header("READY")
+        print(c(DIM, "  Type !help for commands. Your terminal handles scrolling normally."))
+        print()
+
+        while True:
+            try:
+                prompt = input(c(MAGENTA + BOLD, "  ◈ You › ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            if not prompt:
+                continue
+            if handle_command(prompt):
+                break
+            if prompt.startswith("!") or prompt.startswith("/"):
+                # Known commands have already been handled; unknown commands fall through as chat.
+                if prompt.split(None, 1)[0] in {"!help", "!status", "!models", "!clear", "!reload", "!model", "/help", "/status", "/models", "/clear", "/reload", "/model", "!exit", "/exit"}:
+                    continue
+
+            print(c(YELLOW, "  ◌ Exclusion is thinking..."))
+            answer = chat(prompt)
+            print()
+            print(c(CYAN + BOLD, "  ◈ Exclusion ›"))
+            for paragraph in answer.splitlines() or [""]:
+                if not paragraph.strip():
+                    print()
+                    continue
+                wrapped = textwrap.wrap(paragraph, width=max(20, width() - 5), break_long_words=False, break_on_hyphens=False) or [""]
+                for part in wrapped:
+                    print(c(WHITE, "  " + part))
+            print(line())
+
     finally:
         stop_server()
-        print("\nExclusion Inc stopped.")
+        print(c(DIM, "\n  Exclusion Inc stopped."))
 
 
 if __name__ == "__main__":
