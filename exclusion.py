@@ -1,154 +1,465 @@
 #!/usr/bin/env python3
 """Exclusion Inc: local AI terminal dashboard + llama.cpp client."""
 from __future__ import annotations
-import curses, hashlib, json, platform, re, shutil, subprocess, time, urllib.request
+
+import curses
+import hashlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import textwrap
+import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-ROOT=Path(__file__).resolve().parent
-CFG=json.loads((ROOT/'config/exclusion.json').read_text())
-MODEL_DIR=ROOT/'models'; AUDIT=ROOT/'logs/security.audit'
-LLAMA=Path.home()/'llama.cpp/build/bin/llama-server'
-HOST=CFG.get('host','127.0.0.1'); PORT=int(CFG.get('port',8080)); CONTEXT=int(CFG.get('context',4096)); TEMP=float(CFG.get('temperature',0.7)); SYMBOL=CFG.get('symbol','◈')
-MODEL=CFG.get('default_model','qwen2.5-3b-instruct-q4_k_m.gguf')
-server=None; messages=[]; chat_lines=[]; last_cpu=None
+ROOT = Path(__file__).resolve().parent
+CFG_PATH = ROOT / "config" / "exclusion.json"
+CFG = json.loads(CFG_PATH.read_text(encoding="utf-8"))
+MODEL_DIR = ROOT / "models"
+AUDIT = ROOT / "logs" / "security.audit"
+SERVER_LOG = ROOT / "logs" / "llama-server.log"
+LLAMA = Path.home() / "llama.cpp" / "build" / "bin" / "llama-server"
 
-PATTERNS=[r'(?:show|give|print|reveal|dump|tell)\b.{0,100}(?:system prompt|system message|hidden prompt)',r'(?:show|give|read|print|dump)\b.{0,100}(?:protected\.json|secret|credential|private key)',r'(?:ignore|bypass|disable)\b.{0,100}(?:security|audit|protection)']
+HOST = CFG.get("host", "127.0.0.1")
+PORT = int(CFG.get("port", 8080))
+CONTEXT = int(CFG.get("context", 4096))
+TEMP = float(CFG.get("temperature", 0.7))
+SYMBOL = str(CFG.get("symbol", "◈"))
+MODEL = str(CFG.get("default_model", "qwen2.5-3b-instruct-q4_k_m.gguf"))
+
+server: subprocess.Popen | None = None
+messages: list[dict[str, str]] = []
+chat_lines: list[str] = []
+
+PATTERNS = [
+    r"(?:show|give|print|reveal|dump|tell)\b.{0,100}(?:system prompt|system message|hidden prompt)",
+    r"(?:show|give|read|print|dump)\b.{0,100}(?:protected\.json|secret|credential|private key)",
+    r"(?:ignore|bypass|disable)\b.{0,100}(?:security|audit|protection)",
+]
 
 
-def sha(s): return hashlib.sha256(s.encode()).hexdigest()
-def audit(kind,text):
-    AUDIT.parent.mkdir(parents=True,exist_ok=True); prev='0'*64
-    if AUDIT.exists():
-        try: prev=json.loads(AUDIT.read_text().splitlines()[-1])['event_hash']
-        except Exception: pass
-    e={'timestamp':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),'event_type':kind,'evidence_sha256':sha(text),'previous_event_hash':prev}; e['event_hash']=sha(json.dumps(e,sort_keys=True,separators=(',',':')))
-    with AUDIT.open('a') as f: f.write(json.dumps(e,separators=(',',':'))+'\n')
+def sha(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
 
-def security_check(text):
-    for p in PATTERNS:
-        if re.search(p,text,re.I|re.S): audit('protected-resource-attempt',text); return True
+
+def audit(kind: str, text: str) -> None:
+    try:
+        AUDIT.parent.mkdir(parents=True, exist_ok=True)
+        previous = "0" * 64
+        if AUDIT.exists():
+            try:
+                last = AUDIT.read_text(encoding="utf-8").splitlines()[-1]
+                previous = json.loads(last).get("event_hash", previous)
+            except (OSError, ValueError, IndexError, KeyError):
+                pass
+        event = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event_type": kind,
+            "evidence_sha256": sha(text),
+            "previous_event_hash": previous,
+        }
+        event["event_hash"] = sha(json.dumps(event, sort_keys=True, separators=(",", ":")))
+        with AUDIT.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
+def security_check(text: str) -> bool:
+    for pattern in PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE | re.DOTALL):
+            audit("protected-resource-attempt", text)
+            return True
     return False
 
-def models(): MODEL_DIR.mkdir(exist_ok=True); return sorted(MODEL_DIR.glob('*.gguf'))
-def selected():
-    p=MODEL_DIR/MODEL
-    return p if p.exists() else (models()[0] if models() else None)
 
-def stop_server():
-    global server
-    if server and server.poll() is None:
-        server.terminate()
-        try: server.wait(2)
-        except subprocess.TimeoutExpired: server.kill()
-    server=None
+def models() -> list[Path]:
+    try:
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        return sorted(MODEL_DIR.glob("*.gguf"))
+    except OSError:
+        return []
 
-def start_server():
+
+def selected() -> Path | None:
+    preferred = MODEL_DIR / MODEL
+    if preferred.exists() and preferred.is_file():
+        return preferred
+    available = models()
+    return available[0] if available else None
+
+
+def stop_server() -> None:
     global server
-    m=selected()
-    if not LLAMA.exists(): return False,f'Install llama.cpp first: {LLAMA}'
-    if not m: return False,'No .gguf model in models/'
-    stop_server(); cmd=[str(LLAMA),'-m',str(m),'--host',HOST,'--port',str(PORT),'-c',str(CONTEXT),'--temp',str(TEMP),'--no-webui']
-    try: server=subprocess.Popen(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    except OSError as e: return False,str(e)
-    for _ in range(80):
-        if server.poll() is not None: return False,'llama-server exited during startup'
+    if server is not None:
         try:
-            with urllib.request.urlopen(f'http://{HOST}:{PORT}/health',timeout=.4) as r:
-                if r.status==200: return True,f'Loaded {m.name}'
-        except Exception: time.sleep(.15)
-    return False,'Model server timeout'
+            if server.poll() is None:
+                server.terminate()
+                try:
+                    server.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    server.kill()
+                    server.wait(timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            try:
+                server.kill()
+            except OSError:
+                pass
+        finally:
+            server = None
 
-def chat(prompt):
-    if security_check(prompt): return 'Protected Exclusion Inc resources are not available.'
-    body={'model':MODEL,'messages':[{'role':'system','content':CFG['system_prompt']},*messages,{'role':'user','content':prompt}],'temperature':TEMP,'max_tokens':512,'stream':False}
-    req=urllib.request.Request(f'http://{HOST}:{PORT}/v1/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
+
+def server_error_tail() -> str:
     try:
-        with urllib.request.urlopen(req,timeout=180) as r: ans=json.loads(r.read())['choices'][0]['message']['content'].strip()
-        messages.extend([{'role':'user','content':prompt},{'role':'assistant','content':ans}]); return ans
-    except Exception as e: return f'Local model error: {e}'
+        if not SERVER_LOG.exists():
+            return "llama-server exited during startup"
+        lines = SERVER_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+        useful = [line.strip() for line in lines[-8:] if line.strip()]
+        return "llama-server exited: " + (useful[-1][:180] if useful else "unknown error")
+    except OSError:
+        return "llama-server exited during startup"
 
-def cpu():
+
+def start_server() -> tuple[bool, str]:
+    global server, MODEL
+    model = selected()
+    if not LLAMA.exists():
+        return False, f"llama-server not found: {LLAMA}"
+    if model is None:
+        return False, "No .gguf model found in models/"
+
+    MODEL = model.name
+    stop_server()
+    SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        str(LLAMA), "-m", str(model),
+        "--host", HOST, "--port", str(PORT),
+        "-c", str(CONTEXT), "--temp", str(TEMP),
+        "--no-webui",
+    ]
     try:
-        def r():
-            v=[int(x) for x in Path('/proc/stat').read_text().splitlines()[0].split()[1:]]; return sum(v),v[3]+v[4]
-        a=r(); time.sleep(.025); b=r(); total=b[0]-a[0]; idle=b[1]-a[1]; return f'{100*(1-idle/max(total,1)):4.1f}%'
-    except Exception:return 'N/A'
+        log_handle = SERVER_LOG.open("w", encoding="utf-8")
+        server = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=log_handle,
+            start_new_session=True,
+        )
+        # The child owns the file descriptor after Popen; close our copy.
+        log_handle.close()
+    except (OSError, ValueError) as exc:
+        try:
+            log_handle.close()
+        except Exception:
+            pass
+        server = None
+        return False, f"Could not start llama-server: {exc}"
 
-def ram():
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        if server.poll() is not None:
+            return False, server_error_tail()
+        try:
+            with urllib.request.urlopen(
+                f"http://{HOST}:{PORT}/health", timeout=0.6
+            ) as response:
+                if response.status == 200:
+                    return True, f"Loaded {model.name}"
+        except (urllib.error.URLError, TimeoutError, OSError):
+            time.sleep(0.15)
+
+    return False, "Model server timeout (check logs/llama-server.log)"
+
+
+def chat(prompt: str) -> str:
+    if security_check(prompt):
+        return "Protected Exclusion Inc resources are not available."
+
+    body = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": CFG.get("system_prompt", "You are Exclusion Inc.")},
+            *messages,
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": TEMP,
+        "max_tokens": 512,
+        "stream": False,
+    }
+    request = urllib.request.Request(
+        f"http://{HOST}:{PORT}/v1/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
     try:
-        d={x.split(':')[0]:int(x.split(':')[1].split()[0]) for x in Path('/proc/meminfo').read_text().splitlines()}; return f"{(d['MemTotal']-d.get('MemAvailable',d['MemFree']))/1024:.0f}/{d['MemTotal']/1024:.0f} MB"
-    except Exception:return 'N/A'
+        with urllib.request.urlopen(request, timeout=180) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        choices = payload.get("choices") or []
+        if not choices:
+            return "Local model error: server returned no choices."
+        answer = str(choices[0].get("message", {}).get("content", "")).strip()
+        if not answer:
+            return "Local model error: empty response."
+        messages.extend([
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": answer},
+        ])
+        return answer
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            detail = str(exc)
+        return f"Local model HTTP error {exc.code}: {detail}"
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        return f"Local model error: {exc}"
 
-def disk():
+
+def cpu() -> str:
     try:
-        d=shutil.disk_usage(Path.home()); return f'{d.used/2**30:.1f}/{d.total/2**30:.1f} GB'
-    except Exception:return 'N/A'
+        def read_cpu() -> tuple[int, int]:
+            first = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()[1:]
+            values = [int(x) for x in first]
+            return sum(values), values[3] + values[4]
+        before = read_cpu()
+        time.sleep(0.02)
+        after = read_cpu()
+        total = after[0] - before[0]
+        idle = after[1] - before[1]
+        return f"{100 * (1 - idle / max(total, 1)):4.1f}%"
+    except (OSError, IndexError, ValueError):
+        return "N/A"
 
-def box(text,w):
-    width=max(20,min(w-1,78)); inner=width-2
-    title=' '+text+' '
-    return ['╔'+'═'*inner+'╗','║'+title[:inner].ljust(inner)+'║','╚'+'═'*inner+'╝']
 
-def bar(value,total,width=18):
-    try: pct=max(0,min(1,value/total)); n=int(pct*width); return '█'*n+'░'*(width-n)
-    except Exception:return '░'*width
+def ram() -> str:
+    try:
+        data: dict[str, int] = {}
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            key, value = line.split(":", 1)
+            data[key] = int(value.split()[0])
+        total = data["MemTotal"]
+        available = data.get("MemAvailable", data.get("MemFree", 0))
+        return f"{(total - available) / 1024:.0f}/{total / 1024:.0f} MB"
+    except (OSError, KeyError, ValueError, IndexError):
+        return "N/A"
 
-def redraw(s,status,text):
-    s.erase(); h,w=s.getmaxyx(); m=selected(); mn=m.name if m else 'NO MODEL'
-    pulse=['◈','◇','◆','◇'][int(time.time()*5)%4] if status in ('GENERATING','LOADING') else SYMBOL
-    android='Android / Termux' if shutil.which('getprop') else f'{platform.system()} / Termux'
-    lines=[]
-    for x in box(f'{pulse}  EXCLUSION INC  //  LOCAL AI',w): lines.append((x,True))
-    lines += [(f'  TIME {time.strftime("%H:%M:%S")}   CPU {cpu()}   RAM {ram()}   STORAGE {disk()}',False)]
-    lines += [(f'  OS {android}   KERNEL {platform.release()}',False)]
-    for x in box('SYSTEM',w): lines.append((x,True))
-    lines += [(f'  ENGINE   llama.cpp',False),(f'  MODEL    {mn}',False),(f'  CONTEXT  {CONTEXT} tokens',False),(f'  TEMP     {TEMP:.2f}',False),(f'  SERVER   {HOST}:{PORT}',False)]
-    for x in box('STATUS',w): lines.append((x,True))
-    lines += [(f'  ● {status}',False),('─'*max(1,min(w-1,78)),False)]
-    # Chat occupies the middle area.
-    chat_start=len(lines); footer=4; usable=max(1,h-chat_start-footer)
-    for line in chat_lines[-usable:]: lines.append((line,False))
-    while len(lines)<h-footer: lines.append(('',False))
-    lines += [('─'*max(1,min(w-1,78)),False),(f'  CONTEXT  {bar(len(messages),max(1,CONTEXT//20))}  messages={len(messages)}',False),(f'  {pulse}  You › {text}',False)]
-    for y,(row,bold) in enumerate(lines[:h]):
-        try: s.addstr(y,0,row[:w-1],curses.A_BOLD if bold else 0)
-        except curses.error: pass
-    s.refresh()
 
-def wrap(prefix,text,w):
-    import textwrap; out=textwrap.wrap(text,max(10,w-len(prefix)-2)) or ['']; return [prefix+out[0]]+['   '+x for x in out[1:]]
+def disk() -> str:
+    try:
+        usage = shutil.disk_usage(Path.home())
+        return f"{usage.used / 2**30:.1f}/{usage.total / 2**30:.1f} GB"
+    except OSError:
+        return "N/A"
 
-def ui(s):
-    curses.curs_set(1); s.timeout(200); text=''; status='LOADING'; ok,msg=start_server(); status=msg
+
+def os_name() -> str:
+    if shutil.which("getprop"):
+        try:
+            version = subprocess.check_output(
+                ["getprop", "ro.build.version.release"],
+                text=True,
+                timeout=1,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            return f"Android {version or '?'} / Termux"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return f"{platform.system()} / Termux"
+
+
+def box(title: str, width: int) -> list[str]:
+    width = max(20, min(width - 1, 78))
+    inner = width - 2
+    content = f" {title} "[:inner].ljust(inner)
+    return ["╔" + "═" * inner + "╗", "║" + content + "║", "╚" + "═" * inner + "╝"]
+
+
+def bar(value: int, total: int, width: int = 18) -> str:
+    try:
+        fraction = max(0.0, min(1.0, value / max(total, 1)))
+        filled = int(fraction * width)
+        return "█" * filled + "░" * (width - filled)
+    except (TypeError, ZeroDivisionError):
+        return "░" * width
+
+
+def redraw(screen, status: str, text: str) -> None:
+    try:
+        screen.erase()
+        height, width = screen.getmaxyx()
+        model = selected()
+        model_name = model.name if model else "NO MODEL"
+        pulse = ["◈", "◇", "◆", "◇"][int(time.time() * 5) % 4] if status in ("GENERATING", "LOADING") else SYMBOL
+        lines: list[tuple[str, bool]] = []
+
+        for row in box(f"{pulse}  EXCLUSION INC  //  LOCAL AI", width):
+            lines.append((row, True))
+        lines.append((f"  TIME {time.strftime('%H:%M:%S')}   CPU {cpu()}   RAM {ram()}   STORAGE {disk()}", False))
+        lines.append((f"  OS {os_name()}   KERNEL {platform.release()}", False))
+        for row in box("SYSTEM", width):
+            lines.append((row, True))
+        lines.extend([
+            ("  ENGINE   llama.cpp", False),
+            (f"  MODEL    {model_name}", False),
+            (f"  CONTEXT  {CONTEXT} tokens", False),
+            (f"  TEMP     {TEMP:.2f}", False),
+            (f"  SERVER   {HOST}:{PORT}", False),
+        ])
+        for row in box("STATUS", width):
+            lines.append((row, True))
+        lines.append((f"  ● {status}", False))
+        lines.append(("─" * max(1, min(width - 1, 78)), False))
+
+        footer = 4
+        usable = max(1, height - len(lines) - footer)
+        lines.extend((line, False) for line in chat_lines[-usable:])
+        while len(lines) < height - footer:
+            lines.append(("", False))
+        lines.extend([
+            ("─" * max(1, min(width - 1, 78)), False),
+            (f"  CONTEXT  {bar(len(messages), max(1, CONTEXT // 20))}  messages={len(messages)}", False),
+            (f"  {pulse}  You › {text}", False),
+        ])
+
+        for y, (row, bold) in enumerate(lines[:height]):
+            try:
+                screen.addstr(y, 0, row[: max(1, width - 1)], curses.A_BOLD if bold else 0)
+            except curses.error:
+                pass
+        screen.refresh()
+    except curses.error:
+        # A resize or terminal redraw race should never kill the AI session.
+        try:
+            screen.touchwin()
+            screen.refresh()
+        except curses.error:
+            pass
+
+
+def wrap(prefix: str, value: str, width: int) -> list[str]:
+    available = max(10, width - len(prefix) - 2)
+    wrapped = textwrap.wrap(str(value), available) or [""]
+    return [prefix + wrapped[0]] + [" " * len(prefix) + line for line in wrapped[1:]]
+
+
+def handle_command(command: str, screen) -> tuple[bool, str]:
     global MODEL
+    if command.lower() in ("#endconvo", "!exit", "/exit"):
+        return True, ""
+    if command in ("!help", "/help"):
+        chat_lines.extend([
+            "SYSTEM › !help  !status  !models  !model <file>  !clear  !reload  #endconvo",
+            "SYSTEM › Local-only inference • localhost server • ◈ Exclusion Inc",
+        ])
+        return False, "READY"
+    if command in ("!status", "/status"):
+        chat_lines.append(f"SYSTEM › CPU {cpu()} | RAM {ram()} | STORAGE {disk()} | {os_name()} | kernel {platform.release()}")
+        return False, "READY"
+    if command in ("!models", "/models"):
+        available = models()
+        if not available:
+            chat_lines.append("SYSTEM › Models: none")
+        else:
+            chat_lines.append("SYSTEM › Models: " + ", ".join(x.name for x in available))
+        return False, "READY"
+    if command in ("!clear", "/clear"):
+        chat_lines.clear()
+        messages.clear()
+        return False, "READY"
+    if command in ("!reload", "/reload"):
+        ok, message = start_server()
+        return False, message if ok else "ERROR: " + message
+    if command.startswith("!model ") or command.startswith("/model "):
+        name = command.split(None, 1)[1].strip()
+        candidate = MODEL_DIR / name
+        if candidate.exists() and candidate.is_file() and candidate.suffix.lower() == ".gguf":
+            MODEL = candidate.name
+            ok, message = start_server()
+            return False, "MODEL CHANGED: " + message if ok else "ERROR: " + message
+        return False, "Model not found: " + name
+    return False, ""
+
+
+def ui(screen) -> None:
+    global server
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+    try:
+        screen.keypad(True)
+        screen.timeout(100)
+    except curses.error:
+        pass
+
+    text = ""
+    status = "LOADING"
+    ok, message = start_server()
+    status = message if ok else "ERROR: " + message
+
     while True:
-        redraw(s,status,text); ch=s.get_wch()
-        if ch==-1: continue
-        if isinstance(ch,str) and ch in ('\n','\r'):
-            q=text.strip(); text=''
-            if not q: continue
-            if q.lower() in ('#endconvo','!exit','/exit'): return
-            if q in ('!help','/help'):
-                chat_lines.extend(['SYSTEM › !help  !status  !models  !model <file>  !clear  !reload  #endconvo','SYSTEM › Local-only inference • localhost server • ◈ Exclusion Inc']); continue
-            if q in ('!status','/status'):
-                chat_lines.append(f'SYSTEM › CPU {cpu()} | RAM {ram()} | STORAGE {disk()} | {platform.system()} {platform.release()}'); continue
-            if q in ('!models','/models'):
-                chat_lines.append('SYSTEM › Models: '+(', '.join(x.name for x in models()) or 'none')); continue
-            if q in ('!clear','/clear'): chat_lines.clear(); messages.clear(); continue
-            if q in ('!reload','/reload'): ok,msg=start_server(); status=msg; continue
-            if q.startswith('!model ') or q.startswith('/model '):
-                name=q.split(None,1)[1].strip()
-                if (MODEL_DIR/name).exists(): MODEL=name; ok,msg=start_server(); status='MODEL CHANGED: '+msg
-                else: status='Model not found: '+name
+        redraw(screen, status, text)
+        try:
+            key = screen.get_wch()
+        except curses.error:
+            # Termux/Python curses may raise "no input" on a timed get_wch().
+            # Treat it exactly like a timeout instead of crashing.
+            continue
+        except KeyboardInterrupt:
+            return
+
+        if key == curses.KEY_RESIZE:
+            continue
+        if isinstance(key, str) and key in ("\n", "\r"):
+            query = text.strip()
+            text = ""
+            if not query:
                 continue
-            if not server or server.poll() is not None: ok,msg=start_server(); status=msg
-            if not server or server.poll() is not None: chat_lines.append('SYSTEM › '+status); continue
-            chat_lines.extend(wrap('YOU  › ',q,s.getmaxyx()[1])); status='GENERATING'; redraw(s,status,text); ans=chat(q); chat_lines.extend(wrap('AI   › ',ans,s.getmaxyx()[1])); status='READY'
-        elif ch in (curses.KEY_BACKSPACE,'\b','\x7f'): text=text[:-1]
-        elif isinstance(ch,str) and ch.isprintable(): text+=ch
+            should_exit, command_status = handle_command(query, screen)
+            if should_exit:
+                return
+            if command_status:
+                status = command_status
+                continue
 
-def main():
-    try: curses.wrapper(ui)
-    finally: stop_server(); print('\nExclusion Inc stopped.')
+            if server is None or server.poll() is not None:
+                ok, message = start_server()
+                status = message if ok else "ERROR: " + message
+            if server is None or server.poll() is not None:
+                chat_lines.append("SYSTEM › " + status)
+                continue
 
-if __name__=='__main__': main()
+            width = screen.getmaxyx()[1]
+            chat_lines.extend(wrap("YOU  › ", query, width))
+            status = "GENERATING"
+            redraw(screen, status, text)
+            answer = chat(query)
+            chat_lines.extend(wrap("AI   › ", answer, width))
+            status = "READY"
+        elif key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+            text = text[:-1]
+        elif isinstance(key, str) and key.isprintable():
+            text += key
+
+
+def main() -> None:
+    try:
+        curses.wrapper(ui)
+    except KeyboardInterrupt:
+        pass
+    except Exception as exc:
+        # Keep failures readable instead of dumping an obscure traceback.
+        print(f"\nExclusion Inc error: {type(exc).__name__}: {exc}")
+    finally:
+        stop_server()
+        print("\nExclusion Inc stopped.")
+
+
+if __name__ == "__main__":
+    main()
